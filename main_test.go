@@ -9,7 +9,7 @@ import (
 )
 
 var (
-	message = []string{
+	sampleMessageList = []string{
 		"INDEX|c++|",
 		"INDEX|vim|c++",
 		"REMOVE|vim|",
@@ -26,10 +26,9 @@ func sendMessage(i int, addr string) error {
 	if err != nil {
 		return fmt.Errorf("error: %v", err)
 	}
-	defer conn.Close()
 
-	index := rand.Int31n(int32(len(message)))
-	_, err = conn.Write([]byte(message[index] + "\n"))
+	index := rand.Int31n(int32(len(sampleMessageList)))
+	_, err = conn.Write([]byte(sampleMessageList[index] + "\n"))
 	if err != nil {
 		return fmt.Errorf("error: %v", err)
 	}
@@ -39,7 +38,8 @@ func sendMessage(i int, addr string) error {
 		return fmt.Errorf("error: %v", err)
 	}
 
-	fmt.Printf("response for conn %v:%v: %v", i, message[index], resp)
+	fmt.Printf("response for conn %v:%v: %v", i, sampleMessageList[index], resp)
+	conn.Close()
 	return nil
 }
 
@@ -57,21 +57,22 @@ func worker(addr string, jobs <-chan int, resultsCh chan<- bool) {
 }
 
 func TestServer(t *testing.T) {
-	serverShutdownChan := make(chan struct{})
 	jobs := make(chan int)
 	results := make(chan bool)
 
-	addr, _ := runServer(serverShutdownChan, 0)
-	fmt.Println("Listening on " + addr)
+	server, _ := newServer(0)
+	go server.runServer()
 
 	for w := 1; w <= 5; w++ {
-		go worker(addr, jobs, results)
+		go worker(server.address, jobs, results)
 	}
 
 	for i := 1; i <= 1000; i++ {
 		jobs <- i
+		<-results
 	}
 
+	// migrate test to a struct
 	close(jobs)
-	close(serverShutdownChan)
+	server.shutdownServer()
 }

@@ -4,25 +4,25 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
-	"log"
 	"net"
 	"os"
 	"os/signal"
 	"strings"
 	"sync"
 	"syscall"
+
+	log "github.com/sirupsen/logrus"
 )
 
 const (
-	host     = "0.0.0.0"
-	connType = "tcp"
-	index    = "INDEX"
-	remove   = "REMOVE"
-	query    = "QUERY"
+	defaultHost = "0.0.0.0"
+	connType    = "tcp"
+	indexCmd    = "INDEX"
+	removeCmd   = "REMOVE"
+	queryCmd    = "QUERY"
 )
 
-// TODO why does this need to be capitalized to be used
-type Message struct {
+type message struct {
 	command      string
 	pkg          string
 	dependencies []string
@@ -34,11 +34,74 @@ type dataStore struct {
 	pkgRefrence map[string]uint
 }
 
-func newDataStore() *dataStore {
-	return &dataStore{
-		pkgInfo:     make(map[string][]string),
-		pkgRefrence: make(map[string]uint),
+type pkgServer struct {
+	port               int
+	address            string
+	maxGoroutines      int
+	sigHandlerChan     chan os.Signal
+	serverShutdownChan chan struct{}
+	listner            net.Listener
+	dataStore          dataStore
+}
+
+func (s *pkgServer) runServer() {
+	signal.Notify(s.sigHandlerChan, syscall.SIGINT, syscall.SIGTERM)
+	go s.acceptConnections()
+
+	<-s.sigHandlerChan
+	s.shutdownServer()
+}
+
+func (s *pkgServer) shutdownServer() {
+	close(s.serverShutdownChan)
+}
+
+func (s *pkgServer) acceptConnections() {
+	guard := make(chan struct{}, s.maxGoroutines)
+
+	for {
+		select {
+		case <-s.serverShutdownChan:
+			break
+		default:
+		}
+
+		guard <- struct{}{} // block if guard channel is already filled
+		conn, err := s.listner.Accept()
+		defer s.listner.Close()
+
+		if err != nil {
+			log.Errorf("Error accepting: %v\n", err)
+			os.Exit(1)
+		}
+
+		go func(c net.Conn) {
+			s.dataStore.handleRequest(c)
+			<-guard
+		}(conn)
 	}
+}
+
+func newServer(port int) (*pkgServer, error) {
+	address := fmt.Sprintf("%s:%d", defaultHost, port)
+	listner, err := net.Listen(connType, address)
+	if err != nil {
+		return nil, err
+	}
+
+	log.Infof("Listening on " + listner.Addr().String())
+	return &pkgServer{
+		port:               port,
+		address:            listner.Addr().String(),
+		maxGoroutines:      100,
+		sigHandlerChan:     make(chan os.Signal, 1),
+		serverShutdownChan: make(chan struct{}),
+		listner:            listner,
+		dataStore: dataStore{
+			pkgInfo:     make(map[string][]string),
+			pkgRefrence: make(map[string]uint),
+		},
+	}, nil
 }
 
 func (ds *dataStore) Load(key string) (value []string, ok bool) {
@@ -58,10 +121,10 @@ func (ds *dataStore) Query(key string) bool {
 // look up packages dependencies and check if there are references
 func (ds *dataStore) Remove(key string) (ok bool) {
 	ds.Lock()
+	defer ds.Unlock()
 
 	deps, found := ds.pkgInfo[key]
 	if !found {
-		ds.Unlock()
 		return true
 	}
 
@@ -71,7 +134,6 @@ func (ds *dataStore) Remove(key string) (ok bool) {
 		ds.pkgRefrence[dep]--
 	}
 
-	ds.Unlock()
 	return true
 }
 
@@ -91,13 +153,12 @@ func (ds *dataStore) increment(key string) {
 */
 func (ds *dataStore) Store(pkg string, deps []string) (ok bool) {
 	ds.Lock()
+	defer ds.Unlock()
 
 	// read all deps and find out if this can be installed
-
 	for _, dep := range deps {
 		_, ok := ds.pkgInfo[dep]
 		if !ok {
-			ds.Unlock()
 			return false
 		}
 	}
@@ -118,16 +179,15 @@ func (ds *dataStore) Store(pkg string, deps []string) (ok bool) {
 		ds.increment(dep)
 	}
 
-	ds.Unlock()
 	return true
 }
 
-func (ds *dataStore) handleMsg(message string) (string, error) {
-	m := strings.TrimSpace(message)
+func (ds *dataStore) handleMsg(incomingMsg string) (string, error) {
+	m := strings.TrimSpace(incomingMsg)
 	s := strings.Split(m, "|")
 
 	if len(s) < 3 {
-		return "ERROR", fmt.Errorf("Incorrect format for string %+x, %v", message, m)
+		return "ERROR", fmt.Errorf("Incorrect format for string %+x, %v", incomingMsg, m)
 	}
 
 	var deps = []string{}
@@ -135,7 +195,7 @@ func (ds *dataStore) handleMsg(message string) (string, error) {
 		deps = strings.Split(s[2], ",")
 	}
 
-	msg := Message{
+	msg := message{
 		command:      s[0],
 		pkg:          s[1],
 		dependencies: deps,
@@ -143,18 +203,18 @@ func (ds *dataStore) handleMsg(message string) (string, error) {
 	response := "OK"
 
 	switch msg.command {
-	case index:
+	case indexCmd:
 		ok := ds.Store(msg.pkg, msg.dependencies)
 		if !ok {
 			response = "FAIL"
 		}
-	case remove:
+	case removeCmd:
 
 		ok := ds.Remove(msg.pkg)
 		if !ok {
 			response = "FAIL"
 		}
-	case query:
+	case queryCmd:
 		ok := ds.Query(msg.pkg)
 		if !ok {
 			response = "FAIL"
@@ -178,68 +238,24 @@ func (ds *dataStore) handleRequest(c net.Conn) {
 
 		response, err := ds.handleMsg(msg)
 		if err != nil {
-			fmt.Printf("fail to handle message: %v %v\n", response, err)
+			log.Errorf("fail to handle message: %v %v\n", response, err)
 		}
 
-		fmt.Printf("Sending response for msg\n: %v -> %v\n", msg, response)
+		log.Debugf("Sending response for msg\n: %v -> %v\n", msg, response)
 		c.Write([]byte(response + "\n"))
 	}
 }
 
-func acceptConnections(l net.Listener, shutdown chan struct{}) {
-	maxGoroutines := 100
-	guard := make(chan struct{}, maxGoroutines)
-	ds := newDataStore()
-
-	for {
-		select {
-		case <-shutdown:
-			break
-		default:
-		}
-
-		guard <- struct{}{} // block if guard channel is already filled
-		conn, err := l.Accept()
-		defer l.Close()
-
-		if err != nil {
-			fmt.Printf("Error accepting: %v\n", err)
-			os.Exit(1)
-		}
-
-		go func(c net.Conn) {
-			ds.handleRequest(c)
-			<-guard
-		}(conn)
-	}
-
-}
-
-func runServer(shutdown chan struct{}, port int) (string, error) {
-	address := fmt.Sprintf("%s:%d", host, port)
-	l, err := net.Listen(connType, address)
-	if err != nil {
-		return "", err
-	}
-
-	go acceptConnections(l, shutdown)
-
-	return l.Addr().String(), nil
-}
-
 func main() {
-	log.New(os.Stdout, "", log.Ldate|log.Ltime|log.Lmicroseconds)
-
-	sigHandlerChan := make(chan os.Signal, 1)
-	signal.Notify(sigHandlerChan, syscall.SIGINT, syscall.SIGTERM)
-
 	port := flag.Int("port", 0, "The port your server exposes to clients")
+	debugMode := flag.Bool("debug", false, "Print extra info")
 	flag.Parse()
 
-	serverShutdownChan := make(chan struct{})
-	addr, _ := runServer(serverShutdownChan, *port)
-	fmt.Println("Listening on " + addr)
+	if *debugMode {
+		log.Info("Debug mode active")
+		log.SetLevel(log.DebugLevel)
+	}
 
-	<-sigHandlerChan
-	close(serverShutdownChan)
+	server, _ := newServer(*port)
+	server.runServer()
 }
