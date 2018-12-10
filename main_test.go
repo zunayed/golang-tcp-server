@@ -60,7 +60,10 @@ func TestServer(t *testing.T) {
 	jobs := make(chan int)
 	results := make(chan bool)
 
-	server, _ := newServer(0)
+	server, err := newServer(0)
+	if err != nil {
+		t.Error("Expected no error, got", err)
+	}
 	go server.runServer()
 
 	for w := 1; w <= 5; w++ {

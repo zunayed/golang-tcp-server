@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/signal"
-	"syscall"
 
 	log "github.com/sirupsen/logrus"
 )
@@ -25,7 +23,7 @@ type message struct {
 }
 
 type pkgServer struct {
-	port               int
+	requestedPort      int
 	address            string
 	maxGoroutines      int
 	sigHandlerChan     chan os.Signal
@@ -34,19 +32,11 @@ type pkgServer struct {
 	dataStore          DataStore
 }
 
-func (s *pkgServer) runServer() {
-	signal.Notify(s.sigHandlerChan, syscall.SIGINT, syscall.SIGTERM)
-	go s.acceptConnections()
-
-	<-s.sigHandlerChan
-	s.shutdownServer()
-}
-
 func (s *pkgServer) shutdownServer() {
 	close(s.serverShutdownChan)
 }
 
-func (s *pkgServer) acceptConnections() {
+func (s *pkgServer) runServer() {
 	guard := make(chan struct{}, s.maxGoroutines)
 
 	for {
@@ -81,7 +71,7 @@ func newServer(port int) (*pkgServer, error) {
 
 	log.Infof("Listening on " + listner.Addr().String())
 	return &pkgServer{
-		port:               port,
+		requestedPort:      port,
 		address:            listner.Addr().String(),
 		maxGoroutines:      100,
 		sigHandlerChan:     make(chan os.Signal, 1),

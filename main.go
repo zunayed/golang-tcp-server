@@ -3,6 +3,8 @@ package main
 import (
 	"flag"
 	"os"
+	"os/signal"
+	"syscall"
 
 	log "github.com/sirupsen/logrus"
 )
@@ -22,5 +24,12 @@ func main() {
 		log.Errorf("Error setting up server: %v\n", err)
 		os.Exit(1)
 	}
-	server.runServer()
+
+	// Capture exit signals
+	signal.Notify(server.sigHandlerChan, syscall.SIGINT, syscall.SIGTERM)
+	go server.runServer()
+
+	// block until exit signal recived
+	<-server.sigHandlerChan
+	server.shutdownServer()
 }
